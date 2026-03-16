@@ -116,6 +116,7 @@ class ResultResponse(BaseModel):
     report: str
     report_path: str | None
     docx_path: str | None
+    pdf_path: str | None
     artifacts: list[str]
     token_usage: dict[str, int]
     step_timings: dict[str, float]
@@ -421,6 +422,7 @@ async def get_result(task_id: str, session_id: Optional[str] = None) -> ResultRe
         report=state.get("final_report", ""),
         report_path=state.get("report_path") or None,
         docx_path=state.get("docx_path") or None,
+        pdf_path=state.get("pdf_path") or None,
         artifacts=state.get("execution_artifacts", []),
         token_usage=state.get("token_usage", {}),
         step_timings=state.get("step_timings", {}),
@@ -548,6 +550,33 @@ async def get_artifact(task_id: str, filename: str) -> FileResponse:
     if matches:
         return FileResponse(matches[0])
     raise HTTPException(status_code=404, detail="Artifact not found")
+
+
+@app.get("/report/{task_id}/pdf")
+async def download_pdf(task_id: str, session_id: Optional[str] = None) -> FileResponse:
+    """Download the PDF report."""
+    state = _task_store.get(task_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if session_id and not _session_owns_task(session_id, task_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    pdf_path = state.get("pdf_path", "")
+    if pdf_path and Path(pdf_path).exists():
+        return FileResponse(pdf_path, media_type="application/pdf",
+                            filename=f"report_{task_id[:8]}.pdf")
+
+    from config.settings import settings
+    candidates = [
+        settings.ARTIFACTS_DIR / task_id / f"{task_id}_report.pdf",
+        Path(f"/tmp/amas_{task_id}/{task_id}_report.pdf"),
+        Path(f"/tmp/{task_id}_report.pdf"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return FileResponse(str(p), media_type="application/pdf",
+                                filename=f"report_{task_id[:8]}.pdf")
+    raise HTTPException(status_code=404, detail="PDF not yet generated")
 
 
 @app.get("/report/{task_id}/docx")

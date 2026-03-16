@@ -110,6 +110,16 @@ Write a complete, professional Markdown report. Minimum 500 words.
             artifacts_count=len(artifacts),
         )
 
+        pdf_path = build_pdf(
+            task_id=task_id,
+            task=task,
+            report_md=report_md,
+            png_paths=png_artifacts,
+            sources=sources,
+            total_tokens=total_tokens,
+            total_time=total_time,
+        )
+
         # Keep markdown version too (used by chat)
         report_md += f"\n\n---\n*Tokens: {total_tokens:,} · Time: {total_time:.1f}s · Artifacts: {len(artifacts)}*\n"
         md_path = _save_text(report_md, task_id)
@@ -118,6 +128,7 @@ Write a complete, professional Markdown report. Minimum 500 words.
             "final_report": report_md,
             "report_path":  str(docx_path) if docx_path else str(md_path),
             "docx_path":    str(docx_path) if docx_path else "",
+            "pdf_path":     str(pdf_path) if pdf_path else "",
             "workflow_status": "complete",
             "error_message": "",
         }
@@ -381,3 +392,140 @@ def _fallback_md(task: str, subtasks: list, research: str, insights: str) -> str
         lines += ["## Data Overview", "", f"```\n{insights[:600]}\n```", ""]
     lines += ["## Conclusions & Recommendations", "", "See findings above for detailed conclusions.", ""]
     return "\n".join(lines)
+
+
+# ── PDF builder ───────────────────────────────────────────────────────────────
+
+def build_pdf(
+    task_id: str,
+    task: str,
+    report_md: str,
+    png_paths: list[str],
+    sources: list[str],
+    total_tokens: int,
+    total_time: float,
+) -> Path | None:
+    """Generate a PDF version of the report using reportlab."""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Image,
+            HRFlowable, PageBreak, KeepTogether,
+        )
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+    except ImportError:
+        logger.warning("reportlab not installed — skipping PDF")
+        return None
+
+    dest = _get_dest_dir(task_id) / f"{task_id}_report.pdf"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        dest = Path(tempfile.gettempdir()) / f"{task_id}_report.pdf"
+
+    doc = SimpleDocTemplate(
+        str(dest),
+        pagesize=letter,
+        leftMargin=1.1 * inch,
+        rightMargin=1.1 * inch,
+        topMargin=1.1 * inch,
+        bottomMargin=1.1 * inch,
+    )
+
+    styles = getSampleStyleSheet()
+    BLUE   = colors.HexColor("#1a4aff")
+    DARK   = colors.HexColor("#1a2a3a")
+    MUTED  = colors.HexColor("#6a7a9a")
+
+    title_style = ParagraphStyle("NTitle", parent=styles["Normal"],
+        fontSize=28, textColor=BLUE, spaceAfter=4, fontName="Helvetica-Bold", alignment=TA_CENTER)
+    sub_style = ParagraphStyle("NSub", parent=styles["Normal"],
+        fontSize=12, textColor=MUTED, spaceAfter=24, alignment=TA_CENTER)
+    h1_style = ParagraphStyle("NH1", parent=styles["Normal"],
+        fontSize=16, textColor=BLUE, spaceBefore=18, spaceAfter=8, fontName="Helvetica-Bold")
+    h2_style = ParagraphStyle("NH2", parent=styles["Normal"],
+        fontSize=13, textColor=DARK, spaceBefore=14, spaceAfter=6, fontName="Helvetica-Bold")
+    body_style = ParagraphStyle("NBody", parent=styles["Normal"],
+        fontSize=10, textColor=DARK, spaceAfter=6, leading=15, alignment=TA_JUSTIFY)
+    bullet_style = ParagraphStyle("NBullet", parent=styles["Normal"],
+        fontSize=10, textColor=DARK, spaceAfter=4, leftIndent=16, bulletIndent=4, leading=14)
+    meta_style = ParagraphStyle("NMeta", parent=styles["Normal"],
+        fontSize=8, textColor=MUTED, alignment=TA_CENTER, spaceAfter=4)
+    caption_style = ParagraphStyle("NCaption", parent=styles["Normal"],
+        fontSize=9, textColor=MUTED, alignment=TA_CENTER, spaceAfter=12)
+
+    story = []
+
+    # Cover
+    story.append(Spacer(1, 1.5 * inch))
+    story.append(Paragraph("Nexus", title_style))
+    story.append(Paragraph("Autonomous Analysis Report", sub_style))
+    story.append(HRFlowable(width="60%", thickness=1, color=BLUE, spaceAfter=20, lineCap="round"))
+    task_preview = task[:220] + ("…" if len(task) > 220 else "")
+    story.append(Paragraph(f'<i>"{task_preview}"</i>', ParagraphStyle("TQ",
+        parent=body_style, alignment=TA_CENTER, textColor=DARK, spaceAfter=24)))
+    story.append(Paragraph(
+        f"Tokens: {total_tokens:,}  ·  Time: {total_time:.1f}s", meta_style))
+    story.append(PageBreak())
+
+    # Parse MD into reportlab elements
+    for line in report_md.splitlines():
+        line = line.rstrip()
+        if line.startswith("## "):
+            story.append(Paragraph(_escape(line[3:]), h1_style))
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#dde4f0"), spaceAfter=6))
+        elif line.startswith("# "):
+            story.append(Paragraph(_escape(line[2:]), h1_style))
+        elif line.startswith("### "):
+            story.append(Paragraph(_escape(line[4:]), h2_style))
+        elif line.startswith(("- ", "* ")):
+            story.append(Paragraph(f"• {_escape(line[2:])}", bullet_style))
+        elif re.match(r"^\d+\.\s", line):
+            story.append(Paragraph(_escape(re.sub(r"^\d+\.\s", "", line)), bullet_style))
+        elif line.startswith("---"):
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#ccc"), spaceAfter=8))
+        elif line.startswith("```") or line.strip() == "":
+            pass
+        else:
+            if line.strip():
+                story.append(Paragraph(_escape(line), body_style))
+
+    # Charts
+    valid_pngs = [p for p in png_paths if Path(p).exists()]
+    if valid_pngs:
+        story.append(Spacer(1, 0.3 * inch))
+        story.append(Paragraph("Charts & Visualisations", h1_style))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#dde4f0"), spaceAfter=8))
+        for png in valid_pngs:
+            p = Path(png)
+            try:
+                img = Image(str(p), width=5.5 * inch, height=3.5 * inch, kind="proportional")
+                story.append(KeepTogether([img, Paragraph(p.stem.replace("_", " ").title(), caption_style)]))
+                story.append(Spacer(1, 0.2 * inch))
+            except Exception as exc:
+                logger.warning("PDF image error %s: %s", p.name, exc)
+
+    # Sources
+    if sources:
+        story.append(Paragraph("Sources", h1_style))
+        for s in sources[:8]:
+            story.append(Paragraph(f"• {_escape(s)}", bullet_style))
+
+    try:
+        doc.build(story)
+        logger.info("PDF saved: %s", dest)
+        return dest
+    except Exception as exc:
+        logger.error("PDF build failed: %s", exc)
+        return None
+
+
+def _escape(text: str) -> str:
+    """Escape special XML chars for reportlab."""
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;"))
