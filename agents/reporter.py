@@ -37,14 +37,14 @@ Use EXACTLY these section headings (## prefix):
 ## Key Findings & Insights
 ## Data Overview
 ## Conclusions & Recommendations
-## Appendix
+## Appendix (if the user requests for it.)
 
 Rules:
 - Write a FULL report — at least 500 words
 - Use the research summary as the primary knowledge source
 - Never mention pipeline errors, retries, or technical failures
 - Use bullet points inside sections where appropriate
-- The Appendix section should contain a brief code description only
+- The Appendix section should contain a brief code description only if the user requests for it.
 """
 
 
