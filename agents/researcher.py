@@ -1,12 +1,9 @@
 """
 Research Agent
 ──────────────
-Gathers information for the current subtask via:
-  1. Web search (DuckDuckGo)
-  2. Vector memory retrieval (ChromaDB)
-  3. LLM-based summarisation of gathered context
-
-Outputs a structured research summary stored in agent state.
+Gathers information and produces a research summary.
+Robust — works even when web search and vector memory are both unavailable.
+Falls back to LLM general knowledge so the pipeline always continues.
 """
 
 from __future__ import annotations
@@ -16,86 +13,107 @@ from typing import Any
 
 from agents.base import BaseAgent
 from agents.state import AgentState
-from tools.web_search import WebSearchTool
-from tools.vector_search import VectorSearchTool
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a research analyst. Given a task and raw source material,
-produce a concise, factual research summary that will help a coder
-write accurate Python code to complete the task.
+You are a research analyst and data science expert.
+Produce a detailed, factual research summary that will guide a Python coder
+to implement a complete data analysis.
 
-Structure your output as:
+Your summary MUST include:
+
 ## Summary
-[2-4 paragraph summary]
+A 3-4 paragraph overview of the topic with real-world context and numbers.
 
-## Key Facts
-- [bullet list of important data points, numbers, or findings]
+## Key Facts & Data Points
+- Specific numbers, percentages, and statistics relevant to the task
+- Known datasets or data sources that would be relevant
+- Key trends and patterns
 
-## Recommended Approach
-[Brief technical recommendation for implementing the task in Python]
+## Recommended Python Implementation
+A concrete technical plan covering:
+- What synthetic data to generate (columns, ranges, realistic values)
+- What statistical methods to apply
+- What chart types to create (with specific variable names)
+- What insights to look for
+
+Be specific with numbers. For example: "EV sales grew from 1M units in 2018 to 14M in 2023".
 """
 
 
 class ResearchAgent(BaseAgent):
-    """Performs web + vector search and summarises findings."""
+    """Produces a research summary, with web search as optional enhancement."""
 
-    LLM_ROLE = "fast"
+    LLM_ROLE = "primary"
 
     def __init__(self) -> None:
         super().__init__("ResearchAgent")
-        self.web_search = WebSearchTool()
-        self.vector_search = VectorSearchTool()
 
     def run(self, state: AgentState) -> dict[str, Any]:
-        task = state.get("original_task", "")
+        task     = state.get("original_task", "")
         subtasks = state.get("subtasks", [])
-        idx = state.get("current_subtask_index", 0)
-        current_subtask = subtasks[idx] if subtasks else task
+        idx      = state.get("current_subtask_index", 0)
+        focus    = subtasks[idx] if subtasks else task
 
-        self.logger.info("Researching: %s", current_subtask)
+        self.logger.info("Researching: %s", focus[:80])
 
-        # ── 1. Web search ─────────────────────────────────────────────────────
-        web_results = self.web_search.search(current_subtask, max_results=5)
-        web_text = "\n\n".join(
-            f"[{r['title']}]\n{r['snippet']}" for r in web_results
-        )
+        # ── 1. Try web search (non-fatal if it fails) ─────────────────────────
+        web_context = ""
+        sources: list[str] = []
+        try:
+            from tools.web_search import WebSearchTool
+            results = WebSearchTool().search(task, max_results=4)
+            if results:
+                web_context = "\n\n".join(
+                    f"[{r['title']}]\n{r['snippet']}" for r in results
+                )
+                sources = [r["url"] for r in results if r.get("url")]
+                self.logger.info("Web search returned %d results", len(results))
+        except Exception as exc:
+            self.logger.warning("Web search unavailable: %s — using LLM knowledge", exc)
 
-        # ── 2. Vector memory search ───────────────────────────────────────────
-        memory_results = self.vector_search.search(current_subtask, top_k=3)
-        memory_text = "\n\n".join(
-            f"[Memory {i+1}]\n{r}" for i, r in enumerate(memory_results)
-        )
+        # ── 2. Try vector memory (non-fatal if it fails) ──────────────────────
+        memory_context = ""
+        try:
+            from tools.vector_search import VectorSearchTool
+            hits = VectorSearchTool().search(task, top_k=2)
+            if hits:
+                memory_context = "\n\n".join(hits)
+        except Exception as exc:
+            self.logger.debug("Vector memory unavailable: %s", exc)
 
-        sources = [r.get("url", "") for r in web_results if r.get("url")]
+        # ── 3. Build context block ────────────────────────────────────────────
+        context = ""
+        if web_context:
+            context += f"\n\n### Web Search Results\n{web_context}"
+        if memory_context:
+            context += f"\n\n### Relevant Memory\n{memory_context}"
+        if not context:
+            context = "\n\n(Use your training knowledge — be specific with numbers and data.)"
 
-        # ── 3. LLM summarisation ──────────────────────────────────────────────
-        context_block = ""
-        if web_text.strip():
-            context_block += f"\n\n=== WEB SEARCH RESULTS ===\n{web_text}"
-        if memory_text.strip():
-            context_block += f"\n\n=== MEMORY CONTEXT ===\n{memory_text}"
+        # ── 4. LLM summarisation — always runs ───────────────────────────────
+        prompt = f"""Task: {task}
 
-        if not context_block.strip():
-            context_block = "(No external data retrieved; use general knowledge.)"
+Current focus: {focus}
 
-        prompt = f"""
-Task: {task}
-Current subtask: {current_subtask}
+Available context:{context}
 
-Available context:{context_block}
-
-Produce a structured research summary to guide Python implementation.
+Produce a detailed research summary and Python implementation plan.
+Be very specific with data ranges and numbers so the coder can generate realistic synthetic data.
 """
         response = self.llm.complete(prompt, system_prompt=_SYSTEM_PROMPT)
         summary = response["content"]
 
-        # ── 4. Store summary in vector memory for future retrieval ────────────
-        self.vector_search.store(
-            text=summary,
-            metadata={"task_id": state.get("task_id", ""), "subtask": current_subtask},
-        )
+        # ── 5. Store in memory (non-fatal) ────────────────────────────────────
+        try:
+            from tools.vector_search import VectorSearchTool
+            VectorSearchTool().store(
+                text=summary,
+                metadata={"task_id": state.get("task_id", ""), "subtask": focus},
+            )
+        except Exception:
+            pass
 
         return {
             "research_summary": summary,

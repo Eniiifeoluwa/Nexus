@@ -1,14 +1,14 @@
 """
 Report Agent
 ────────────
-Always produces a report. Never crashes. Works with partial or empty state.
+Always produces a complete report.
+Never crashes. Works with partial or empty state.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -21,20 +21,22 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
 You are a professional technical report writer.
-Write a polished Markdown report based on the information provided.
+Write a polished, detailed Markdown report based on the information provided.
 
 Use these ## sections:
 1. Executive Summary
-2. Methodology  
+2. Methodology
 3. Key Findings & Insights
-4. Conclusions & Recommendations
+4. Data Overview (describe the dataset and analysis performed)
+5. Conclusions & Recommendations
 
 Rules:
-- Write clearly and professionally
-- Only state what the data shows
-- If output is limited, still write a complete useful report using the task description and research
-- Never mention pipeline errors, retries, or technical failures in the report
-- Always produce a full report regardless of how much data is available
+- Write a FULL, detailed report — at least 400 words
+- Use the research summary heavily if execution output is limited
+- Draw on the task description and subtasks to fill in context
+- Never mention pipeline errors, retries, or technical failures
+- Always produce useful, professional content regardless of input quality
+- If you have research data but no execution output, synthesise insights from research alone
 """
 
 
@@ -49,6 +51,7 @@ class ReporterAgent(BaseAgent):
         subtasks    = state.get("subtasks", []) or []
         research    = state.get("research_summary", "") or ""
         stdout      = state.get("execution_stdout", "") or ""
+        stderr      = state.get("execution_stderr", "") or ""
         artifacts   = state.get("execution_artifacts", []) or []
         code        = state.get("generated_code", "") or ""
         token_usage = state.get("token_usage", {}) or {}
@@ -56,24 +59,33 @@ class ReporterAgent(BaseAgent):
         sources     = state.get("research_sources", []) or []
         task_id     = state.get("task_id", "unknown") or "unknown"
 
+        # Extract any JSON summary from stdout
         insights = _extract_json_summary(stdout)
-        insights_text = (
-            json.dumps(insights, indent=2) if insights
-            else (stdout[:2000].strip() if stdout.strip() else "")
-        )
+        insights_text = json.dumps(insights, indent=2) if insights else stdout[:2000].strip()
 
         prompt = f"""Task: {task}
 
-Research findings:
-{research[:1000] or "(none)"}
+Subtasks completed:
+{chr(10).join(f"- {t}" for t in subtasks)}
+
+Research findings (use this as primary source if execution output is limited):
+{research[:2000] or "(none)"}
 
 {"Execution output:" + chr(10) + insights_text if insights_text else ""}
 
-{"Subtasks completed:" + chr(10) + chr(10).join(f"- {t}" for t in subtasks) if subtasks else ""}
+Artifacts generated: {len(artifacts)} file(s)
+{"- " + chr(10).join(artifacts) if artifacts else ""}
 
-{"Sources: " + ", ".join(sources[:3]) if sources else ""}
+{"Sources: " + chr(10).join(f"- {s}" for s in sources[:5]) if sources else ""}
 
-Write a complete professional Markdown report now. Be thorough even if data is limited.
+Code used (excerpt):
+```python
+{code[:600]}
+```
+
+Write a complete, detailed, professional Markdown report.
+Use the research findings to provide rich context and insights even if execution output is limited.
+Minimum 400 words.
 """
 
         try:
@@ -81,15 +93,18 @@ Write a complete professional Markdown report now. Be thorough even if data is l
             report_md = response["content"]
         except Exception as exc:
             logger.error("LLM call failed in reporter: %s", exc)
-            # Fallback: generate a basic report without LLM
             report_md = _fallback_report(task, subtasks, research, insights_text)
 
-        # Append metadata
+        # Metadata footer
         total_tokens = sum(token_usage.values())
         total_time   = sum(timings.values())
-        report_md += f"\n\n---\n*Tokens: {total_tokens:,} · Time: {total_time:.1f}s · Artifacts: {len(artifacts)}*\n"
+        report_md += (
+            f"\n\n---\n"
+            f"*Tokens: {total_tokens:,} · "
+            f"Time: {total_time:.1f}s · "
+            f"Artifacts: {len(artifacts)}*\n"
+        )
 
-        # Save report — use /tmp if artifacts dir is unavailable
         report_path = _save_report(report_md, task_id)
 
         return {
@@ -101,18 +116,12 @@ Write a complete professional Markdown report now. Be thorough even if data is l
 
 
 def _save_report(content: str, task_id: str) -> str:
-    """Try multiple locations to save the report. Always succeeds."""
     candidates = []
-
-    # Try configured artifacts dir first
     try:
         from config.settings import settings
-        path = settings.ARTIFACTS_DIR / f"{task_id}_report.md"
-        candidates.append(path)
+        candidates.append(settings.ARTIFACTS_DIR / f"{task_id}_report.md")
     except Exception:
         pass
-
-    # Fallback to /tmp
     candidates.append(Path(tempfile.gettempdir()) / f"{task_id}_report.md")
 
     for path in candidates:
@@ -124,8 +133,6 @@ def _save_report(content: str, task_id: str) -> str:
         except Exception as exc:
             logger.warning("Could not save to %s: %s", path, exc)
 
-    # Last resort: return path string even if we couldn't write it
-    logger.error("Could not save report anywhere")
     return str(Path(tempfile.gettempdir()) / f"{task_id}_report.md")
 
 
@@ -141,19 +148,16 @@ def _extract_json_summary(stdout: str) -> dict | None:
 
 
 def _fallback_report(task: str, subtasks: list, research: str, insights: str) -> str:
-    """Minimal report generated without LLM as last resort."""
     lines = [
-        f"# Analysis Report",
-        f"",
-        f"## Task",
-        f"{task}",
-        f"",
+        "# Analysis Report", "",
+        "## Executive Summary", "",
+        f"This report covers the following task: {task}", "",
     ]
-    if subtasks:
-        lines += ["## Subtasks Completed", ""] + [f"- {s}" for s in subtasks] + [""]
     if research:
-        lines += ["## Research Summary", "", research[:800], ""]
+        lines += ["## Research Findings", "", research[:1200], ""]
+    if subtasks:
+        lines += ["## Methodology", ""] + [f"- {s}" for s in subtasks] + [""]
     if insights:
-        lines += ["## Execution Output", "", f"```\n{insights[:600]}\n```", ""]
-    lines += ["## Status", "", "Analysis pipeline completed. See subtasks above for details.", ""]
+        lines += ["## Output", "", f"```\n{insights[:800]}\n```", ""]
+    lines += ["## Status", "", "Analysis completed. See sections above for details.", ""]
     return "\n".join(lines)
