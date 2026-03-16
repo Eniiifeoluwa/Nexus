@@ -695,13 +695,27 @@ with tab_results:
                     st.markdown("<div style='font-size:0.72rem;color:#4a6fa5;text-transform:uppercase;letter-spacing:.08em;margin:16px 0 8px'>Generated Artifacts</div>", unsafe_allow_html=True)
                     for a in artifacts:
                         p = Path(a)
-                        if p.exists():
-                            if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".svg"):
-                                st.image(str(p), caption=p.name, use_container_width=True)
-                            else:
-                                st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:#c8deff;padding:6px 0'>📁 {p.name}</div>", unsafe_allow_html=True)
+                        filename = p.name
+                        # Build URL pointing to Railway API
+                        img_url = f"{st.session_state.api_host}/artifacts/{task_id}/{filename}"
+                        if p.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                            try:
+                                img_resp = requests.get(img_url, timeout=10)
+                                if img_resp.status_code == 200:
+                                    st.image(img_resp.content, caption=filename, use_container_width=True)
+                                    st.download_button(
+                                        f"⬇ Download {filename}",
+                                        data=img_resp.content,
+                                        file_name=filename,
+                                        mime="image/png",
+                                        key=f"dl_{filename}",
+                                    )
+                                else:
+                                    st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:#4a6fa5;padding:6px 0'>📁 {filename} (not yet available)</div>", unsafe_allow_html=True)
+                            except Exception as e:
+                                st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:#4a6fa5;padding:6px 0'>📁 {filename}</div>", unsafe_allow_html=True)
                         else:
-                            st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:#4a6fa5;padding:6px 0'>📁 {a}</div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='font-family:Space Mono,monospace;font-size:0.78rem;color:#c8deff;padding:6px 0'>📁 {filename} — <a href='{img_url}' target='_blank' style='color:#2a7aff'>Download</a></div>", unsafe_allow_html=True)
 
             elif wf_status == "running":
                 st.info("⏳ Task still running… switch to the Monitor tab.")
