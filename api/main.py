@@ -185,14 +185,20 @@ async def _run_workflow(task_id: str, task_text: str, metadata: dict) -> None:
 
     except Exception as exc:
         logger.exception("Workflow error for task %s: %s", task_id, exc)
-        error_state: AgentState = {
-            **initial_state,
-            "workflow_status": "failed",
-            "error_message": str(exc),
-        }
+        # Try to get whatever partial state was stored before the crash
+        existing = _task_store.get(task_id, {})
+        # If we have a report already, mark complete not failed
+        if existing.get("final_report"):
+            recovery_state: AgentState = {**existing, "workflow_status": "complete"}
+        else:
+            recovery_state: AgentState = {
+                **initial_state,
+                "workflow_status": "failed",
+                "error_message": "The workflow encountered an unexpected error. Please try again.",
+            }
         async with _task_lock:
-            _task_store[task_id] = error_state
-        metrics.finish_task(task_id, error_state)
+            _task_store[task_id] = recovery_state
+        metrics.finish_task(task_id, recovery_state)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
