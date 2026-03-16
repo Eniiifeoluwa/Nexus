@@ -1,0 +1,32 @@
+# ── Sandbox execution image ────────────────────────────────────────────────────
+# Minimal Python image for safe code execution.
+# Network is disabled at container runtime (--network=none).
+FROM python:3.11-slim
+
+# System dependencies for scientific Python stack
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create restricted execution user
+RUN useradd -m -s /bin/bash sandbox && \
+    mkdir -p /tmp/artifacts && \
+    chown sandbox:sandbox /tmp/artifacts
+
+# Install allowed scientific libraries only
+RUN pip install --no-cache-dir \
+        pandas==2.2.2 \
+        numpy==1.26.4 \
+        matplotlib==3.9.0 \
+        seaborn==0.13.2 \
+        scikit-learn==1.5.0 \
+        scipy==1.13.1
+
+# Switch to restricted user
+USER sandbox
+WORKDIR /home/sandbox
+
+# Default: execute code passed via -c flag
+ENTRYPOINT ["python3"]
