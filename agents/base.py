@@ -44,10 +44,19 @@ class BaseAgent(ABC):
             updates = self.run(state)
         except Exception as exc:
             self.logger.exception("✗ %s failed: %s", self.name, exc)
-            updates = {
-                "workflow_status": "failed",
-                "error_message": f"{self.name} error: {exc}",
-            }
+            # Only the ReporterAgent failure is truly terminal.
+            # All other agent failures are logged but workflow continues
+            # so the Reporter can still compile whatever was produced.
+            if self.name == "ReporterAgent":
+                updates = {
+                    "workflow_status": "failed",
+                    "error_message": "The report could not be generated. Please try again.",
+                }
+            else:
+                # Let workflow continue — downstream agents handle partial state
+                updates = {
+                    "error_message": f"{self.name} encountered an issue and was skipped.",
+                }
 
         elapsed = round(time.perf_counter() - start, 3)
         self.logger.info("✔ %s finished in %.3fs", self.name, elapsed)

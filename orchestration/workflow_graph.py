@@ -1,37 +1,10 @@
 """
 LangGraph Workflow Graph
 ────────────────────────
-Defines the full agent orchestration graph:
+START → Planner → Researcher → Coder → Executor → Critic → Reporter → END
 
-    START
-      │
-      ▼
-   Planner ──────────────────────────────────┐
-      │                                       │
-      ▼                                       │
-   Researcher                                 │
-      │                                       │
-      ▼                                       │
-    Coder                                     │
-      │                                       │
-      ▼                                       │
-   Executor                                   │
-      │                                       │
-      ▼                                       │
-    Critic ──► fail ──► Coder (retry loop)   │
-      │                                       │
-      ├──► human_review ──► [await]           │
-      │                                       │
-      ▼ pass                                  │
-   Reporter                                   │
-      │                                       │
-      ▼                                       │
-     END ◄──────────────────────────────────┘
-
-The graph supports:
-  - Cyclic retry loop (Critic → Coder → Executor → Critic)
-  - Human-in-the-loop pause state
-  - Conditional routing based on agent verdicts
+The Critic can send back to Coder once for a retry.
+After that, everything goes to Reporter regardless — no dead ends.
 """
 
 from __future__ import annotations
@@ -51,114 +24,100 @@ from agents.reporter import ReporterAgent
 
 logger = logging.getLogger(__name__)
 
-# ── Node name constants ────────────────────────────────────────────────────────
-NODE_PLANNER = "planner"
+NODE_PLANNER    = "planner"
 NODE_RESEARCHER = "researcher"
-NODE_CODER = "coder"
-NODE_EXECUTOR = "executor"
-NODE_CRITIC = "critic"
-NODE_REPORTER = "reporter"
+NODE_CODER      = "coder"
+NODE_EXECUTOR   = "executor"
+NODE_CRITIC     = "critic"
+NODE_REPORTER   = "reporter"
 
 
-# ── Routing functions ──────────────────────────────────────────────────────────
+def route_after_planner(state: AgentState) -> str:
+    if state.get("workflow_status") == "failed":
+        # Even on planner failure, try to go to reporter with what we have
+        return NODE_REPORTER
+    return NODE_RESEARCHER
 
-def route_after_critic(
-    state: AgentState,
-) -> Literal["coder", "reporter", "__end__"]:
-    """
-    Decides the next node after Critic evaluation.
 
-    - "fail"         → back to Coder for a retry
-    - "human_review" → END (workflow paused; API layer picks it up)
-    - "pass"         → forward to Reporter
-    """
-    verdict = state.get("critic_verdict", "pass")
+def route_after_critic(state: AgentState) -> str:
+    verdict  = state.get("critic_verdict", "pass")
     workflow = state.get("workflow_status", "running")
 
-    if workflow in ("failed", "awaiting_human"):
-        logger.info("Routing: workflow=%s → END", workflow)
+    # Human review requested — pause here
+    if workflow == "awaiting_human":
+        logger.info("Routing: awaiting human review → END")
         return END  # type: ignore[return-value]
 
-    if verdict == "fail":
-        logger.info("Routing: critic=fail → coder (retry)")
-        return NODE_CODER
+    # Hard failure with no recovery possible
+    if workflow == "failed":
+        logger.info("Routing: workflow failed → reporter anyway")
+        return NODE_REPORTER
 
+    # One retry allowed
+    if verdict == "fail":
+        retry = state.get("retry_count", 0)
+        if retry <= 1:
+            logger.info("Routing: critic=fail retry=%d → coder", retry)
+            return NODE_CODER
+        else:
+            # Retries exhausted — go to reporter with what we have
+            logger.info("Routing: retries exhausted → reporter")
+            return NODE_REPORTER
+
+    # Pass or anything else → reporter
     logger.info("Routing: critic=pass → reporter")
     return NODE_REPORTER
 
 
-def route_after_planner(state: AgentState) -> Literal["researcher", "__end__"]:
-    """Short-circuit on planning failure."""
-    if state.get("workflow_status") == "failed":
-        return END  # type: ignore[return-value]
-    return NODE_RESEARCHER
-
-
-# ── Graph construction ─────────────────────────────────────────────────────────
-
-def build_workflow() -> StateGraph:
-    """
-    Construct and compile the LangGraph StateGraph.
-
-    Returns a compiled graph ready to be invoked with an initial AgentState.
-    """
-    # Instantiate agents (each is a callable node)
-    planner = PlannerAgent()
+def build_workflow():
+    planner    = PlannerAgent()
     researcher = ResearchAgent()
-    coder = CoderAgent()
-    executor = ExecutorAgent()
-    critic = CriticAgent()
-    reporter = ReporterAgent()
+    coder      = CoderAgent()
+    executor   = ExecutorAgent()
+    critic     = CriticAgent()
+    reporter   = ReporterAgent()
 
-    # Build graph
     graph = StateGraph(AgentState)
 
-    # Register nodes
-    graph.add_node(NODE_PLANNER, planner)
+    graph.add_node(NODE_PLANNER,    planner)
     graph.add_node(NODE_RESEARCHER, researcher)
-    graph.add_node(NODE_CODER, coder)
-    graph.add_node(NODE_EXECUTOR, executor)
-    graph.add_node(NODE_CRITIC, critic)
-    graph.add_node(NODE_REPORTER, reporter)
+    graph.add_node(NODE_CODER,      coder)
+    graph.add_node(NODE_EXECUTOR,   executor)
+    graph.add_node(NODE_CRITIC,     critic)
+    graph.add_node(NODE_REPORTER,   reporter)
 
-    # Entry point
     graph.set_entry_point(NODE_PLANNER)
 
-    # Linear edges
     graph.add_conditional_edges(
         NODE_PLANNER,
         route_after_planner,
-        {NODE_RESEARCHER: NODE_RESEARCHER, END: END},
+        {NODE_RESEARCHER: NODE_RESEARCHER, NODE_REPORTER: NODE_REPORTER},
     )
     graph.add_edge(NODE_RESEARCHER, NODE_CODER)
-    graph.add_edge(NODE_CODER, NODE_EXECUTOR)
-    graph.add_edge(NODE_EXECUTOR, NODE_CRITIC)
+    graph.add_edge(NODE_CODER,      NODE_EXECUTOR)
+    graph.add_edge(NODE_EXECUTOR,   NODE_CRITIC)
 
-    # Conditional branching from Critic
     graph.add_conditional_edges(
         NODE_CRITIC,
         route_after_critic,
         {
-            NODE_CODER: NODE_CODER,      # retry loop
-            NODE_REPORTER: NODE_REPORTER, # success path
-            END: END,                     # failure / human review
+            NODE_CODER:     NODE_CODER,
+            NODE_REPORTER:  NODE_REPORTER,
+            END:            END,
         },
     )
 
-    # Reporter always terminates
     graph.add_edge(NODE_REPORTER, END)
 
     return graph.compile()
 
 
-# ── Module-level compiled graph (lazy) ────────────────────────────────────────
 _workflow = None
-
 
 def get_workflow():
     global _workflow
     if _workflow is None:
         logger.info("Compiling LangGraph workflow…")
         _workflow = build_workflow()
-        logger.info("Workflow compiled ✔")
+        logger.info("Workflow compiled")
     return _workflow
