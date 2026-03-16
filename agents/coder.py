@@ -30,12 +30,15 @@ Generate clean, complete, executable Python code to accomplish the given task.
 CRITICAL RULES:
 1. Output ONLY the raw Python code — no prose, no markdown fences, no explanation.
 2. The code must be self-contained and runnable with no user input.
-3. Save all output files to /tmp/artifacts/ — create this directory at the start.
+3. The variable _ARTIFACTS is already defined as a pathlib.Path — use it for all output files.
 4. For any dataset not provided, generate realistic synthetic data with numpy/pandas.
-5. All plots must be saved as PNG files (use matplotlib/seaborn, never plt.show()).
-6. Include try/except for I/O and numeric operations.
-7. Print a JSON summary at the end: {"status": "success", "files": [...], "insights": [...]}
-8. Use only these libraries: pandas, numpy, matplotlib, seaborn, scikit-learn, json, os, pathlib.
+5. ALWAYS add these two lines at the very top of your code:
+   import matplotlib
+   matplotlib.use("Agg")
+6. All plots must be saved as PNG files using plt.savefig(_ARTIFACTS / "name.png"), never plt.show().
+7. Include try/except around the entire main logic block.
+8. Print a JSON summary at the end: {"status": "success", "files": [...], "insights": [...]}
+9. Use only: pandas, numpy, matplotlib, seaborn, scikit-learn, json, os, pathlib.
 """
 
 _RETRY_ADDENDUM = """\
