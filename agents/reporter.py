@@ -8,8 +8,6 @@ Compiles a professional .docx report with:
   - Key findings
   - Embedded charts (PNG → inline image)
   - Conclusions
-  - Appendix (code excerpt), if explicitly requested for by the user.
-
 Falls back gracefully if python-docx is unavailable.
 """
 
@@ -37,14 +35,12 @@ Use EXACTLY these section headings (## prefix):
 ## Key Findings & Insights
 ## Data Overview
 ## Conclusions & Recommendations
-## Appendix (if the user requests for it.)
 
 Rules:
 - Write a FULL report — at least 500 words
 - Use the research summary as the primary knowledge source
 - Never mention pipeline errors, retries, or technical failures
 - Use bullet points inside sections where appropriate
-- The Appendix section should contain a brief code description only if the user requests for it.
 """
 
 
