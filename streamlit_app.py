@@ -112,7 +112,7 @@ def _friendly_error(exc=None, status_code=None):
 
 DEFAULTS = {
     "session_id": None, "task_id": None, "result": None,
-    "start_time": None, "submit_error": None, "chat_input": "",
+    "start_time": None, "submit_error": None, "chat_input": "", "chat_pending_code": "", "chat_new_images": [],
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -446,14 +446,26 @@ with tab_chat:
         hd, _ = api_get(f"/chat/{task_id}/history?session_id={_sid()}")
         history = hd.get("history",[]) if hd else []
 
-        # Render chat thread
+        # Show pending code block from last response
+        if st.session_state.get("chat_pending_code"):
+            st.markdown("<div class='section-label' style='margin-bottom:8px'>Code</div>", unsafe_allow_html=True)
+            st.code(st.session_state.chat_pending_code, language="python")
+            st.session_state.chat_pending_code = ""
+
+        # Render chat thread — clean replies only, no raw code
         if history:
             st.markdown("<div class='chat-wrap'>", unsafe_allow_html=True)
             for msg in history:
                 role    = msg.get("role","")
-                content = msg.get("content","")
-                cls     = "chat-user" if role=="user" else "chat-assistant"
-                st.markdown(f"<div class='{cls}'>{content}</div>", unsafe_allow_html=True)
+                content_text = msg.get("content","")
+                intent  = msg.get("intent","chat")
+                # Strip any code fences that leaked into assistant replies
+                import re
+                content_text = re.sub(r"```[\s\S]*?```", "", content_text).strip()
+                if not content_text:
+                    continue
+                cls = "chat-user" if role=="user" else "chat-assistant"
+                st.markdown(f"<div class='{cls}'>{content_text}</div>", unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
         else:
             # Suggested questions when chat is empty
@@ -505,7 +517,15 @@ with tab_chat:
             if err:
                 notice("error","Could not send message",err)
             else:
-                new_arts = resp.get("new_artifacts",[])
+                intent    = resp.get("intent","chat")
+                new_arts  = resp.get("new_artifacts",[])
+                code_resp = resp.get("code","")
+
+                # Handle code_only intent — show code block, no chart
+                if intent == "code_only" and code_resp.strip():
+                    st.session_state.chat_pending_code = code_resp
+
+                # Handle new chart artifacts
                 if new_arts:
                     imgs = []
                     for a in new_arts:
