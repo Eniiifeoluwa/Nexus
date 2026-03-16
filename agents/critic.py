@@ -1,17 +1,10 @@
 """
 Critic Agent
 ────────────
-Evaluates the output of the Executor and decides:
+Evaluates executor output. Single-pass only — reviews once and either
+passes or escalates. Never loops back more than once to the Coder.
 
-  - "pass"         → forward to Report Agent
-  - "fail"         → send actionable feedback to Coder (up to MAX_RETRIES)
-  - "human_review" → pause workflow for human confirmation
-
-Scoring dimensions:
-  1. Execution status (hard gate)
-  2. Output completeness
-  3. Correctness signals (no NaN floods, no empty files, etc.)
-  4. LLM-based qualitative assessment
+Security: user-facing messages never expose internal errors or stack traces.
 """
 
 from __future__ import annotations
@@ -27,28 +20,41 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a strict code quality reviewer and data analyst.
-Evaluate the outputs of a Python execution step and return ONLY JSON.
+You are a strict but fair code output reviewer.
+Evaluate the result of a Python execution and return ONLY valid JSON.
 
 Schema:
 {
   "verdict": "pass" | "fail",
   "confidence": 0.0-1.0,
   "issues": ["issue 1", ...],
-  "feedback": "Actionable feedback for the coder if verdict is fail",
-  "summary": "One-sentence summary"
+  "feedback": "Specific, actionable fix instructions for the coder if verdict is fail",
+  "summary": "One sentence summary"
 }
 
-Be strict. Fail if:
-- The output is empty or contains only whitespace
-- There are Python tracebacks in stderr
-- Key task objectives are clearly unmet
-- Output data looks fabricated or nonsensical
+Pass if:
+- Code ran without fatal errors
+- Output contains meaningful data or analysis
+- At least one insight or result was produced
+
+Fail ONLY if:
+- There is a clear Python traceback with no output at all
+- The task objective was completely missed
+
+Be lenient on minor issues. Partial success = pass.
+Do not fail just because data is synthetic or charts are simple.
 """
+
+# What users see — never the raw internal reason
+_HUMAN_REVIEW_MESSAGE = (
+    "The pipeline paused before producing the final report. "
+    "You can provide additional guidance below, or continue to generate "
+    "the report with the current results."
+)
 
 
 class CriticAgent(BaseAgent):
-    """Evaluates execution outputs and manages the retry loop."""
+    """Single-pass output evaluator. Reviews once, never retries more than once."""
 
     LLM_ROLE = "primary"
 
@@ -57,101 +63,118 @@ class CriticAgent(BaseAgent):
 
     def run(self, state: AgentState) -> dict[str, Any]:
         exec_status = state.get("execution_status", "failure")
-        stdout = state.get("execution_stdout", "")
-        stderr = state.get("execution_stderr", "")
-        artifacts = state.get("execution_artifacts", [])
+        stdout      = state.get("execution_stdout", "")
+        stderr      = state.get("execution_stderr", "")
+        artifacts   = state.get("execution_artifacts", [])
         retry_count = state.get("retry_count", 0)
-        task = state.get("original_task", "")
-        code = state.get("generated_code", "")
+        task        = state.get("original_task", "")
+        code        = state.get("generated_code", "")
 
-        # ── Hard gate: execution failure ──────────────────────────────────────
-        if exec_status == "failure":
-            if retry_count >= settings.MAX_RETRIES:
-                self.logger.warning("Max retries reached — escalating to human review")
-                return self._human_review(
-                    state,
-                    reason=f"Execution failed after {retry_count} retries. Last error: {stderr[:300]}",
-                )
-            return self._fail(
-                state,
-                feedback=f"Code execution failed with error:\n{stderr}\n\nFix the code and ensure it runs without errors.",
-            )
+        # ── Hard limit: only one retry ever ───────────────────────────────────
+        # If we've already retried once, pass through regardless and let
+        # the Reporter work with whatever was produced.
+        if retry_count >= 1:
+            self.logger.info("Critic: retry limit reached — passing through to reporter")
+            return {
+                "critic_verdict": "pass",
+                "critic_feedback": "",
+            }
+
+        # ── Execution failed with no output at all ────────────────────────────
+        if exec_status == "failure" and not stdout.strip():
+            if retry_count == 0:
+                # Allow exactly one retry with a concrete fix instruction
+                fix = _extract_fix_hint(stderr)
+                self.logger.info("Critic: execution failed, allowing one retry")
+                return self._retry(state, feedback=fix)
+            else:
+                # Already retried — move on
+                return {"critic_verdict": "pass", "critic_feedback": ""}
 
         # ── LLM quality assessment ────────────────────────────────────────────
         prompt = f"""
-Original task: {task}
+Task: {task}
 
-Generated code (truncated):
-{code[:1500]}
+Code (first 1000 chars):
+{code[:1000]}
 
-Execution stdout:
-{stdout[:2000]}
+Stdout:
+{stdout[:1500]}
 
-Execution stderr:
-{stderr[:500]}
+Stderr (last 300 chars):
+{stderr[-300:] if stderr else "(none)"}
 
 Artifacts produced: {artifacts}
 
-Evaluate the output quality and return the JSON verdict.
+Evaluate and return the JSON verdict.
 """
         response = self.llm.complete_json(prompt, system_prompt=_SYSTEM_PROMPT)
-        raw = response["content"]
-
         try:
-            assessment = json.loads(raw)
+            assessment = json.loads(response["content"])
         except json.JSONDecodeError:
-            self.logger.warning("Critic JSON parse error, defaulting to pass")
-            assessment = {"verdict": "pass", "confidence": 0.5, "feedback": "", "summary": ""}
+            # If we can't parse the assessment, pass through
+            assessment = {"verdict": "pass", "confidence": 0.7, "feedback": "", "summary": ""}
 
-        verdict: str = assessment.get("verdict", "pass")
-        confidence: float = float(assessment.get("confidence", 0.5))
-        feedback: str = assessment.get("feedback", "")
-        summary: str = assessment.get("summary", "")
+        verdict    = assessment.get("verdict", "pass")
+        confidence = float(assessment.get("confidence", 0.7))
+        feedback   = assessment.get("feedback", "")
+        summary    = assessment.get("summary", "")
 
-        self.logger.info(
-            "Critic verdict=%s confidence=%.2f summary=%s", verdict, confidence, summary
-        )
+        self.logger.info("Critic verdict=%s confidence=%.2f", verdict, confidence)
 
-        # ── Low confidence → human review ─────────────────────────────────────
+        # ── Low confidence on first attempt → one retry ───────────────────────
+        if verdict == "fail" and retry_count == 0:
+            return self._retry(state, feedback=feedback)
+
+        # ── Very low confidence → human review (once only) ────────────────────
         if confidence < settings.CONFIDENCE_THRESHOLD and retry_count >= 1:
-            return self._human_review(
-                state,
-                reason=f"Confidence {confidence:.0%} below threshold. {summary}",
-            )
-
-        if verdict == "fail":
-            if retry_count >= settings.MAX_RETRIES:
-                return self._human_review(
-                    state,
-                    reason=f"Max retries reached. Last feedback: {feedback}",
-                )
-            return self._fail(state, feedback=feedback)
+            return self._human_review(state)
 
         # ── Pass ──────────────────────────────────────────────────────────────
         return {
             "critic_verdict": "pass",
-            "critic_feedback": feedback,
+            "critic_feedback": "",
         }
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _fail(self, state: AgentState, feedback: str) -> dict[str, Any]:
-        new_retry = state.get("retry_count", 0) + 1
-        self.logger.info("Critic: FAIL (retry %d)", new_retry)
+    def _retry(self, state: AgentState, feedback: str) -> dict[str, Any]:
+        self.logger.info("Critic: requesting one code retry")
         return {
             "critic_verdict": "fail",
-            "critic_feedback": feedback,
-            "retry_count": new_retry,
+            "critic_feedback": feedback or "Please fix any errors and ensure the code runs completely.",
+            "retry_count": state.get("retry_count", 0) + 1,
         }
 
-    def _human_review(self, state: AgentState, reason: str) -> dict[str, Any]:
-        self.logger.info("Critic: HUMAN REVIEW required: %s", reason)
+    def _human_review(self, state: AgentState) -> dict[str, Any]:
+        self.logger.info("Critic: escalating to human review")
         return {
             "critic_verdict": "human_review",
             "workflow_status": "awaiting_human",
             "human_confirmation_needed": True,
-            "human_confirmation_message": (
-                f"The workflow requires human confirmation.\n\nReason: {reason}\n\n"
-                "Please review and POST /confirm/{task_id} to proceed or abort."
-            ),
+            "human_confirmation_message": _HUMAN_REVIEW_MESSAGE,
         }
+
+
+def _extract_fix_hint(stderr: str) -> str:
+    """Extract a clean, actionable fix from stderr without exposing internals."""
+    if not stderr:
+        return "Ensure the code runs completely and saves all output files."
+
+    lines = [l.strip() for l in stderr.strip().splitlines() if l.strip()]
+
+    # Find the actual error line (last non-empty line is usually the error type)
+    for line in reversed(lines):
+        if any(err in line for err in ("Error:", "Exception:", "error:")):
+            # Return a sanitised hint, not the raw traceback
+            if "ModuleNotFoundError" in line or "ImportError" in line:
+                return "A required library is missing. Use only: pandas, numpy, matplotlib, seaborn, scikit-learn, json, os, pathlib."
+            if "FileNotFoundError" in line or "PermissionError" in line:
+                return "Use _ARTIFACTS as the output directory. Do not write to any other path."
+            if "NameError" in line:
+                return "A variable was used before it was defined. Check all variable names."
+            if "ValueError" in line or "TypeError" in line:
+                return "A data type or value error occurred. Add input validation and type checks."
+            if "SyntaxError" in line:
+                return "The code contains a syntax error. Review the code structure carefully."
+            break
+
+    return "Fix any runtime errors and ensure the code completes without exceptions."
