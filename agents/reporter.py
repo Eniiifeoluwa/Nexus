@@ -8,7 +8,7 @@ Compiles a professional .docx report with:
   - Key findings
   - Embedded charts (PNG → inline image)
   - Conclusions
-  - Appendix (code excerpt)
+  - Appendix (code excerpt), if explicitly requested for by the user.
 
 Falls back gracefully if python-docx is unavailable.
 """
