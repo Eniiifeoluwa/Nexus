@@ -1,4 +1,11 @@
+"""
+Nexus — Autonomous Multi-Agent AI System
+─────────────────────────────────────────
+Production frontend. Beautiful, secure, robust.
+"""
+
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -345,10 +352,16 @@ DEFAULTS = {
     "start_time": None,
     "submit_error": None,
     "api_online": None,
+    "session_token": None,
+    "owned_task_ids": [],   # task IDs submitted by this browser session only
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Assign a unique token to this browser session (persists across reruns)
+if not st.session_state.session_token:
+    st.session_state.session_token = str(uuid.uuid4())
 
 
 # ── API layer ──────────────────────────────────────────────────────────────────
@@ -462,8 +475,10 @@ with st.sidebar:
     st.markdown("<div class='section-label'>Recent</div>", unsafe_allow_html=True)
 
     tasks_data, _ = api_get("/tasks")
-    if tasks_data and tasks_data.get("tasks"):
-        for t in list(reversed(tasks_data["tasks"]))[:6]:
+    owned = set(st.session_state.owned_task_ids)
+    my_tasks = [t for t in (tasks_data or {}).get("tasks", []) if t.get("task_id") in owned]
+    if my_tasks:
+        for t in list(reversed(my_tasks))[:6]:
             preview = t.get("task", "")[:36] + ("…" if len(t.get("task", "")) > 36 else "")
             if st.button(preview, key=f"side_{t['task_id']}", use_container_width=True):
                 st.session_state.task_id = t["task_id"]
@@ -541,6 +556,7 @@ with tab_run:
                     st.session_state.log = []
                     st.session_state.start_time = time.time()
                     st.session_state.submit_error = None
+                    st.session_state.owned_task_ids.append(resp["task_id"])
                     notice("success", "Task submitted", "Switch to the Monitor tab to follow progress.")
                     time.sleep(0.7)
                     st.rerun()
@@ -793,11 +809,12 @@ with tab_history:
             st.rerun()
 
     tasks_data, tasks_err = api_get("/tasks")
+    owned = set(st.session_state.owned_task_ids)
 
     if tasks_err:
         notice("warn", "Could not load history", tasks_err)
     elif tasks_data and tasks_data.get("tasks"):
-        tasks = list(reversed(tasks_data["tasks"]))
+        tasks = list(reversed([t for t in tasks_data["tasks"] if t.get("task_id") in owned]))
         st.markdown(
             f"<div style='font-size:0.76rem;color:#3a5070;margin-bottom:16px'>{len(tasks)} task{'s' if len(tasks)!=1 else ''}</div>",
             unsafe_allow_html=True,
@@ -825,9 +842,10 @@ with tab_history:
                 )
             with rr:
                 if st.button("Open", key=f"open_{tid}", use_container_width=True):
-                    st.session_state.task_id = tid
-                    st.session_state.result = None
-                    st.rerun()
+                    if tid in owned:
+                        st.session_state.task_id = tid
+                        st.session_state.result = None
+                        st.rerun()
     else:
         st.markdown(
             "<div style='padding:48px 0;text-align:center;color:#2a3a50;font-size:0.88rem'>No tasks yet.</div>",
