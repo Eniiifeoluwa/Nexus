@@ -286,7 +286,7 @@ for key, default in {
     "result": None,
     "polling": False,
     "log": [],
-    "api_host": "https://nexus-production-ebd3.up.railway.app",
+    "api_host": "http://localhost:8000",
     "last_step": "",
     "start_time": None,
 }.items():
