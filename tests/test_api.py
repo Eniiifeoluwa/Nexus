@@ -1,5 +1,6 @@
 """
 FastAPI endpoint tests using httpx TestClient.
+Run with: pytest tests/test_api.py -v
 """
 import json
 import sys

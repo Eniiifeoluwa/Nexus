@@ -1,5 +1,6 @@
 """
 Unit tests for agents and tools.
+Run with: pytest tests/ -v
 """
 
 import json
